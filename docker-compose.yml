@@ -1,0 +1,60 @@
+version: "3.9"
+services:
+  redis:
+    image: redis:7
+    command: [ "redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru" ] #, "--maxclients", "2000"
+    ports:
+      - "6379:6379"
+#  redis-master:
+#    image: redis:7
+#    command: ["redis-server", "--requirepass", "password"]
+#    ports: ["6379:6379"]
+#
+#  redis-replica:
+#    image: redis:7
+#    command: ["redis-server", "--slaveof", "redis-master", "6379", "--requirepass", "password", "--masterauth", "password"]
+#    depends_on: [redis-master]
+#
+#  sentinel:
+#    image: redis:7
+#    command: [
+#      "redis-sentinel", "./registry/sentinel.conf"
+#    ]
+#    volumes:
+#      - ./sentinel.conf:/etc/redis/sentinel.conf
+#    depends_on: [redis-master, redis-replica]
+#    ports: ["26379:26379"]
+
+  node:
+    build: ./node
+    environment:
+      - DB_FILE=/data/kv.db
+      - MAX_IN_FLIGHT=8
+#      - NODE_ADDR=${NODE_ADDR:-http://localhost:5000}
+      - REDIS_HOST=redis
+    volumes:
+      - /data
+    ports:
+      - ":5000"  # Remove this if you don't want to publish all node ports, or use random
+    depends_on:
+      - redis
+    deploy:
+      mode: replicated
+      replicas: 3  # Optional, for Swarm; for docker compose use --scale node=3
+
+  load-balancer:
+    build: ./load_balancer
+    environment:
+      - REDIS_HOST=redis
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+      - node
+
+#  client:
+#    build: ./client
+#    depends_on:
+#      - load-balancer
+
+volumes: {}
