@@ -5,10 +5,9 @@ import time
 import sqlite3
 import requests
 import random
-import redis
 import signal
 import math
-from redis.sentinel import Sentinel
+import logging
 
 app = Flask(__name__)
 
@@ -16,17 +15,26 @@ app = Flask(__name__)
 DB_FILE = os.environ.get("DB_FILE", "/data/kv.db")
 MAX_IN_FLIGHT = int(os.environ.get("MAX_IN_FLIGHT", 32))
 NODE_ID = os.environ.get("NODE_ID", f"node-{random.randint(1, 1e6)}")
-NODE_ADDR = os.environ.get("NODE_ADDR", "http://localhost:5000")
-REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
-REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
+NODE_HOST = os.environ.get("NODE_HOST", "localhost")
+NODE_PORT = int(os.environ.get("NODE_PORT", 5000))
+NODE_ADDR = os.environ.get("NODE_ADDR", f"http://{NODE_HOST}:{NODE_PORT}")
+SEED_NODE = os.environ.get("SEED_NODE", None)
 REGISTRATION_TTL = 15
 
 # State
 in_flight = 0
 lock = threading.Lock()
-# sentinel = Sentinel([('sentinel', 26379)], socket_timeout=2)
-# r = sentinel.master_for('master', password='password', decode_responses=True)
-r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+
+# Gossip state
+known_nodes = set([NODE_ADDR])
+known_nodes_lock = threading.Lock()
+node_states = {}  # addr -> "joining"/"ready"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s"
+)
+logger = logging.getLogger("node")
 
 def get_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
@@ -35,23 +43,81 @@ def get_db():
     )
     return conn
 
-def register(state="joining"):
+def gossip_thread():
     while True:
+        time.sleep(2)
+        with known_nodes_lock:
+            peers = list(known_nodes - {NODE_ADDR})
+        if not peers:
+            continue
+        peer = random.choice(peers)
         try:
-            r.hset(f"node:{NODE_ID}", mapping={"addr": NODE_ADDR, "state": state})
-            r.expire(f"node:{NODE_ID}", REGISTRATION_TTL)
-            print(f"Node {NODE_ID} registered with state '{state}' at {NODE_ADDR}")
+            with known_nodes_lock:
+                payload = {
+                    "nodes": list(known_nodes),
+                    "states": node_states
+                }
+            logger.info(f"Gossiping with peer: {peer}")
+            resp = requests.post(f"{peer}/gossip", json=payload, timeout=1)
+            if resp.status_code == 200:
+                data = resp.json()
+                their_nodes = set(data.get("nodes", []))
+                their_states = data.get("states", {})
+                with known_nodes_lock:
+                    before = len(known_nodes)
+                    known_nodes.update(their_nodes)
+                    node_states.update(their_states)
+                    after = len(known_nodes)
+                if after > before:
+                    logger.info(f"Discovered {after - before} new node(s) via gossip.")
+                # Visualize cluster membership after gossip
+                with known_nodes_lock:
+                    cluster_view = ", ".join(sorted(known_nodes))
+                logger.info(f"Current cluster: [{cluster_view}]")
         except Exception as e:
-            print("Redis registration error:", e)
-            time.sleep(REGISTRATION_TTL)
-        time.sleep(REGISTRATION_TTL // 2)
+            logger.debug(f"Gossip with {peer} failed: {e}")
 
-def deregister(*a):
+def join_cluster(seed_addr):
+    if not seed_addr or seed_addr == NODE_ADDR:
+        return
     try:
-        r.delete(f"node:{NODE_ID}")
-    except Exception as e:
-        print("Redis deregistration error:", e)
-    os._exit(0)
+        resp = requests.get(f"{seed_addr}/nodes", timeout=2)
+        if resp.status_code == 200:
+            their_nodes = set(resp.json().get("nodes", []))
+            their_states = resp.json().get("states", {})
+            with known_nodes_lock:
+                known_nodes.update(their_nodes)
+                node_states.update(their_states)
+                known_nodes.add(seed_addr)
+    except Exception:
+        pass
+
+@app.route("/gossip", methods=["POST"])
+def gossip():
+    data = request.get_json()
+    their_nodes = set(data.get("nodes", []))
+    their_states = data.get("states", {})
+    with known_nodes_lock:
+        before = len(known_nodes)
+        known_nodes.update(their_nodes)
+        node_states.update(their_states)
+        after = len(known_nodes)
+        if after > before:
+            logger.info(f"Gossip (incoming): Added {after - before} new node(s).")
+        # Visualize cluster membership after gossip
+        cluster_view = ", ".join(sorted(known_nodes))
+        logger.info(f"Current cluster: [{cluster_view}]")
+        # Respond with our view
+        return jsonify({"status": "ok", "added": after - before, "nodes": list(known_nodes), "states": node_states})
+
+@app.route("/nodes", methods=["GET"])
+def get_nodes():
+    with known_nodes_lock:
+        return jsonify({"nodes": list(known_nodes), "states": node_states})
+
+def set_state(state):
+    with known_nodes_lock:
+        node_states[NODE_ADDR] = state
 
 def get_all_local_keys():
     conn = get_db()
@@ -113,19 +179,13 @@ def internal_all_keys():
 
 def initial_sync():
     # Discover existing ready nodes
-    node_keys = r.keys("node:*")
-    peers = []
-    for k in node_keys:
-        node_info = r.hgetall(k)
-        if node_info.get("state") == "ready":
-            peers.append(node_info["addr"])
+    with known_nodes_lock:
+        peers = [n for n in known_nodes if n != NODE_ADDR and node_states.get(n) == "ready"]
     if not peers:
         print("No ready peers found; nothing to sync (first node).")
         return True
     local_keys = set(get_all_local_keys())
     for peer in peers:
-        if peer == NODE_ADDR:
-            continue
         try:
             resp = requests.get(f"{peer}/internal/all_keys", timeout=10)
             peer_keys = set(resp.json().get("keys", []))
@@ -140,20 +200,9 @@ def initial_sync():
     print("Initial sync complete.")
     return True
 
-def post_sync_set_ready():
-    try:
-        r.hset(f"node:{NODE_ID}", "state", "ready")
-    except Exception as e:
-        print("Could not set node state to ready:", e)
-
 def get_live_ready_nodes():
-    node_keys = r.keys("node:*")
-    result = []
-    for k in node_keys:
-        node_info = r.hgetall(k)
-        if node_info.get("state") == "ready":
-            result.append(node_info["addr"])
-    return sorted(set(result))
+    with known_nodes_lock:
+        return sorted([n for n in known_nodes if node_states.get(n) == "ready"])
 
 def compute_quorums():
     nodes = get_live_ready_nodes()
@@ -250,16 +299,21 @@ def coordinator_get():
     latest = max(results, key=lambda x: x["ts"])
     return jsonify({"key": key, "value": latest["value"], "ts": latest["ts"]})
 
+def deregister(*a):
+    # No central registry, just exit
+    os._exit(0)
+
 if __name__ == "__main__":
-    # Register as joining
-    threading.Thread(target=register, args=("joining",), daemon=True).start()
+    # Gossip join
+    if SEED_NODE and SEED_NODE != NODE_ADDR:
+        join_cluster(SEED_NODE)
+    set_state("joining")
+    threading.Thread(target=gossip_thread, daemon=True).start()
     # Sync from ready peers
     initial_sync()
     # Mark as ready
-    post_sync_set_ready()
-    # Start normal registration (state "ready")
-    threading.Thread(target=register, args=("ready",), daemon=True).start()
+    set_state("ready")
     print("Node started with ID:", NODE_ID, "at", NODE_ADDR)
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, deregister)
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=NODE_PORT)

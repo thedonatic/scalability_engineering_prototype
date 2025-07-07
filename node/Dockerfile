@@ -3,6 +3,6 @@ WORKDIR /app
 COPY app.py .
 COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
-RUN pip install flask requests redis
+RUN pip install flask requests
 EXPOSE 5000
 CMD ["./entrypoint.sh"]
