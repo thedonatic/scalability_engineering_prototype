@@ -3,128 +3,139 @@ import requests
 import random
 import uuid
 import time
+import statistics
 
 LB_URL = "http://localhost:8000"
 NUM_CLIENTS = 20
-NUM_REQUESTS = 50
+NUM_REQUESTS = 20
+MAX_RETRIES = 3
 
 class Stats:
     def __init__(self):
         self.lock = threading.Lock()
+        self.gw_overloads = 0
+        self.node_overloads = 0
+        self.not_found = 0
+        self.unknown_error = 0
         self.success = 0
         self.failure = 0
         self.latencies = []
         self.retries = []
-        self.overloads = 0  # Track overloads
 
-    def record(self, success, latency, retries):
+    def record(self, resp, latency, retries, error_type=None):
         with self.lock:
-            if success:
+            if resp is not None and resp.status_code == 200:
                 self.success += 1
+            elif resp is not None and resp.status_code == 503:
+                if error_type == "gateway":
+                    self.gw_overloads += 1
+                elif error_type == "node":
+                    self.node_overloads += 1
+                else:
+                    self.unknown_error += 1
+                self.failure += 1
+            elif resp is not None and resp.status_code == 404:
+                self.not_found += 1
+                self.failure += 1
             else:
+                self.unknown_error += 1
                 self.failure += 1
             self.latencies.append(latency)
             self.retries.append(retries)
-
-    def record_overload(self):
-        with self.lock:
-            self.overloads += 1
 
     def report(self):
         with self.lock:
             total = self.success + self.failure
             avg_latency = sum(self.latencies) / len(self.latencies) if self.latencies else 0
+            med_latency = statistics.median(self.latencies) if self.latencies else 0
+            max_latency = max(self.latencies) if self.latencies else 0
             avg_retries = sum(self.retries) / len(self.retries) if self.retries else 0
             print(f"Total requests: {total}")
-            print(f"Successes: {self.success}")
-            print(f"Failures: {self.failure}")
+            print(f"  Success: {self.success}")
+            print(f"  Failures: {self.failure}")
+            print(f"    - Gateway overloads (503): {self.gw_overloads}")
+            print(f"    - Node overloads (503): {self.node_overloads}")
+            print(f"    - Not found (404): {self.not_found}")
+            print(f"    - Unknown errors: {self.unknown_error}")
             print(f"Average latency: {avg_latency:.3f}s")
+            print(f"Median latency: {med_latency:.3f}s")
+            print(f"Max latency: {max_latency:.3f}s")
             print(f"Average retries per request: {avg_retries:.2f}")
-            print(f"Total overloads (HTTP 503): {self.overloads}")
-
-# Progress tracker
-class Progress:
-    def __init__(self, total):
-        self.lock = threading.Lock()
-        self.completed = 0
-        self.total = total
-
-    def increment(self):
-        with self.lock:
-            self.completed += 1
-
-    def get(self):
-        with self.lock:
-            return self.completed
 
 stats = Stats()
-progress = Progress(NUM_CLIENTS * NUM_REQUESTS * 2)  # 2 requests per iteration (set/get)
 
-def send_with_retries(request_func, max_retries=3, base_delay=0.05, jitter=0.05, stats=None):
+def send_with_retries(request_func):
     attempt = 0
-    while attempt <= max_retries:
+    while attempt <= MAX_RETRIES:
         start = time.time()
         try:
             resp = request_func()
             latency = time.time() - start
-            success = resp is not None and resp.status_code != 503
-            if success:
-                if stats:
-                    stats.record(True, latency, attempt)
-                return resp
-        except Exception:
+            error_type = None
+            if resp is not None:
+                if resp.status_code == 200:
+                    stats.record(resp, latency, attempt)
+                    return
+                elif resp.status_code == 503:
+                    body = resp.json()
+                    if "gateway overloaded" in str(body).lower():
+                        error_type = "gateway"
+                    elif "node overloaded" in str(body).lower():
+                        error_type = "node"
+                    elif "write_failed" in str(body).lower() or "errors" in body:
+                        error_type = "node"
+                    else:
+                        print("Unexpected 503 response:", body)
+                        error_type = "unknown"
+                    stats.record(resp, latency, attempt, error_type)
+                    if error_type in ("gateway", "node"):
+                        delay = 0.03 * (2 ** attempt) + random.uniform(0, 0.03)
+                        time.sleep(delay)
+                        attempt += 1
+                        continue
+                    else:
+                        return
+                elif resp.status_code == 404:
+                    stats.record(resp, latency, attempt, "not_found")
+                    return
+                else:
+                    stats.record(resp, latency, attempt, "unknown")
+                    return
+            else:
+                stats.record(None, latency, attempt, "unknown")
+        except Exception as e:
+            print(e)
             latency = time.time() - start
-        delay = base_delay * (2 ** attempt) + random.uniform(0, jitter)
+            stats.record(None, latency, attempt, "unknown")
+        delay = 0.03 * (2 ** attempt) + random.uniform(0, 0.03)
         time.sleep(delay)
         attempt += 1
-    # If we reach here, all retries failed
-    if stats:
-        stats.record(False, latency, attempt)
-    return None
 
 def client_task(client_id):
-    for _ in range(NUM_REQUESTS):
-        k = f"key{random.randint(1,100)}"
-        v = f"value{random.randint(1,100)}"
+    for i in range(NUM_REQUESTS):
+        k = f"overload-key-{random.randint(1, 1000)}"
+        v = f"overload-value-{random.randint(1, 1000)}"
+        req_id = f"{client_id}-{uuid.uuid4()}"
+
         def set_request():
             return requests.post(
                 f"{LB_URL}/set",
-                json={"key": k, "value": v, "request_id": f"{client_id}-{uuid.uuid4()}"},
+                json={"key": k, "value": v, "request_id": req_id},
                 headers={"X-Client-ID": client_id},
-                timeout=2
+                timeout=5
             )
+        send_with_retries(set_request)
+        time.sleep(random.uniform(0.01, 0.05))
+
         def get_request():
             return requests.get(
                 f"{LB_URL}/get",
                 params={"key": k},
                 headers={"X-Client-ID": client_id},
-                timeout=2
+                timeout=5
             )
-        resp = send_with_retries(set_request, stats=stats)
-        if resp is not None and resp.status_code == 503:
-            # print(f"[{client_id}] SET overloaded")
-            stats.record_overload()
-        progress.increment()
-        resp = send_with_retries(get_request, stats=stats)
-        if resp is not None and resp.status_code == 503:
-            # print(f"[{client_id}] GET overloaded")
-            stats.record_overload()
-        progress.increment()
-        time.sleep(0.05)
-
-def progress_reporter():
-    total = progress.total
-    last_print = -1
-    while True:
-        completed = progress.get()
-        percent = (completed / total) * 100
-        # Print every 10% or at the end
-        if int(percent // 10) != last_print or completed == total:
-            print(f"Progress: {completed}/{total} requests ({percent:.1f}%)")
-            last_print = int(percent // 10)
-        if completed >= total:
-            break
-        time.sleep(1)
+        send_with_retries(get_request)
+        time.sleep(0.01)
 
 threads = []
 for i in range(NUM_CLIENTS):
@@ -132,15 +143,7 @@ for i in range(NUM_CLIENTS):
     t.start()
     threads.append(t)
 
-start_time = time.time()
-progress_thread = threading.Thread(target=progress_reporter)
-progress_thread.start()
-
 for t in threads:
     t.join()
 
-progress_thread.join()
-elapsed = time.time() - start_time
 stats.report()
-print(f"Total time elapsed: {elapsed:.2f} seconds")
-print("Load test completed.")

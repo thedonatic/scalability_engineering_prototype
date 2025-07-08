@@ -4,25 +4,19 @@
 
 ## How to run
 
+Some examples. Default startup is 5 nodes and 3 load-balancers.
+
 ```sh
 docker-compose up --build
 ```
 
 ```sh
-docker-compose run --rm client python client.py --client-id demo1
+docker-compose up --scale node=5
 ```
 
 ```sh
-docker-compose up -d --scale node=3
+ddocker-compose up --scale node=2 -d --scale load-balancer=1
 ```
 
-1. State management:
-The application manages state using sqlite for persisting key-value pairs.
-2. Scalability:
-The architecture supports horizontal scaling by allowing multiple nodes to join, register, and participate in quorum-based operations. The load balancer distributes requests across available nodes and is stateless and can be scaled easily.
-3. Overload mitigation:
-Every component is designed to handle overload gracefully.
-
-Timeouts, retries, and backoff with jitter in the client
-Workload isolation using shuffle-sharding in the load balancer
-Load shedding in the node
+## How to test
+Start the scripts under /test or use a request client like Postman.

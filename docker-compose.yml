@@ -1,29 +1,60 @@
 version: "3.9"
 services:
+
+  seed-node:
+    build: ./node
+    environment:
+      - DB_FILE=/data/kv.db
+      - MAX_IN_FLIGHT=32
+      - NODE_HOST=${HOSTNAME}
+      - NODE_PORT=5000
+      - NODE_ADDR=http://${HOSTNAME}:5000
+      - SEED_NODE=http://seed-node:5000
+    volumes:
+      - /data
+    ports:
+      - "5000:5000"
+
   node:
     build: ./node
     environment:
       - DB_FILE=/data/kv.db
-      - MAX_IN_FLIGHT=8
-      - NODE_HOST=node
+      - MAX_IN_FLIGHT=32
+      - NODE_HOST=${HOSTNAME}
       - NODE_PORT=5000
-      - NODE_ADDR=http://node:5000
-      - SEED_NODE=http://node:5000
+      - NODE_ADDR=http://${HOSTNAME}:5000
+      - SEED_NODE=http://seed-node:5000
     volumes:
       - /data
     ports:
-      - "5000"  # Expose one node for gossip seed and external access
+      - "5000"
     deploy:
       mode: replicated
-      replicas: 3
+      replicas: 4
+    depends_on:
+      - seed-node
+
+  load-balancer-main:
+    build: ./load_balancer
+    environment:
+      - SEED_NODE=http://node:5000
+      - GATEWAY_IN_FLIGHT_LIMIT=10
+    ports:
+      - "8000:8000"
+    depends_on:
+      - node
 
   load-balancer:
     build: ./load_balancer
     environment:
       - SEED_NODE=http://node:5000
+      - GATEWAY_IN_FLIGHT_LIMIT=160
     ports:
-      - "8000:8000"
+      - "8000"
     depends_on:
       - node
+    deploy:
+      mode: replicated
+      replicas: 2
 
 volumes: {}

@@ -3,8 +3,8 @@ import time
 import random
 import uuid
 
-# LB_URL = "http://localhost:8000"
-LB_URL = "http://load-balancer:8000"
+LB_URL = "http://localhost:8000"
+# LB_URL = "http://load-balancer:8000"
 
 def backoff(attempt, base=0.2, cap=2.0):
     sleep = min(cap, base * 2 ** attempt) * (random.random() + 0.5)
